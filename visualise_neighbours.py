@@ -1,31 +1,31 @@
-import pickle
-import vedo
 import numpy as np
+from scipy.spatial import KDTree
+import pandas as pd
+import vedo
 
-# Load the Pickle file (each key is a point, each value is a list of neighbor 3D points)
-with open("within_k_vectors.pkl", "rb") as f:
-    within_k_vectors = pickle.load(f)
+# Generate 3D points
 
-# Extract all unique points & their neighbors in a fully vectorized way
-points = np.array(list(within_k_vectors.keys()))  # These are point indices
-neighbors = list(within_k_vectors.values())  # This is a list of lists of 3D points
+points = pd.read_csv("normals.csv")[['x', 'y', 'z']].values
+num_points = points.shape[0]
 
-# Flatten the neighbors array (convert list of lists into a single NumPy array)
-flat_neighbors = np.concatenate(neighbors, axis=0)  # Fast bulk conversion
+# Build KDTree for k-NN search
+tree = KDTree(points)
+k = 5  # Number of nearest neighbors
+distances, indices = tree.query(points, k + 1)  # +1 because the closest neighbor is the point itself
+indices = indices[:, 1:]  # Remove self-connections
+distances = distances[:, 1:]  # Remove self-connections
 
-# Create a NumPy array of sources (repeating each source for its neighbors)
-source_repeated = np.repeat(points, [len(n) for n in neighbors], axis=0)
+# Prepare the points and lines for visualization
+points_obj = vedo.Points(points, c="blue", r=8)
 
-# Use vedo.Points for efficient rendering of all points
-points_actor = vedo.Points(points, r=4, c="red")
+# Create all pairs of indices using broadcasting
+i = np.repeat(np.arange(num_points), k)  # Repeat each index k times
+j = indices.flatten()  # Flatten the indices of neighbors
 
-# Use vedo.Lines for bulk line rendering between sources and their neighbors
-if len(flat_neighbors) > 0:
-    lines_actor = vedo.Lines(source_repeated, flat_neighbors, c="white", lw=1)
-else:
-    lines_actor = None  # No lines if there are no neighbors
+# Get the 3D coordinates of the points from indices
+i_coords = points[i]  # Coordinates for the points in i
+j_coords = points[j]  # Coordinates for the points in j
 
-# Render using Vedo (fast interactive 3D)
-plotter = vedo.Plotter(title="3D Neighbor Visualization", axes=1, bg="black")
-plotter.show([points_actor, lines_actor] if lines_actor else [points_actor], interactive=True)
-
+# Create the lines object (edges)
+lines_obj = vedo.Lines(i_coords, j_coords, c="red", lw=1)
+vedo.show(lines_obj, axes=1)
