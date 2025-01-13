@@ -52,11 +52,10 @@ ply = PlyData.read("bathtub.ply")
 # Extract vertex data (assuming Gaussian splats are stored under 'vertex')
 vertex_data = ply['vertex'].data  # Structured NumPy array
 # Convert structured array to Pandas DataFrame
-df = pd.DataFrame(vertex_data)
-
+df = pd.DataFrame(vertex_data).sample(1000)
 normals = get_normals(df)
 source_positions = np.array(df[['x', 'y', 'z']].values)
-end_positions = source_positions + 0.02 * normals
+end_positions = source_positions + 0.05 * normals
 
 # Create Arrows
 arrows = vedo.Arrows(

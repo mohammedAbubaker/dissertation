@@ -4,8 +4,13 @@ import pandas as pd
 import vedo
 
 # Generate 3D points
+from plyfile import PlyData
 
-points = pd.read_csv("normals.csv")[['x', 'y', 'z']].values
+# Read PLY file
+ply = PlyData.read("bathtub.ply")
+vertex_data = ply['vertex'].data
+df = pd.DataFrame(vertex_data).sample(1000)
+points = df[['x', 'y', 'z']].values
 num_points = points.shape[0]
 
 # Build KDTree for k-NN search
