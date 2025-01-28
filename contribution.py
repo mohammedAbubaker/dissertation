@@ -1,21 +1,143 @@
+from os import wait
 from plyfile import PlyData
 import pandas as pd
 import numpy as np
 from scipy.spatial.transform import Rotation as R
+from vedo.utils import print_table
 
 
-def get_bounding_box(means, covariances):
-    eigvals, eigvecs = np.linalg.eigh(covariances)
+def ray_intersects_bbox(ori, dir, min_vec, max_vec):
+    """
+    Check if a ray intersects a bounding box.
 
-    # Scale the eigenvectors by the square root of the eigenvalues
-    scales = np.sqrt(eigvals)
-    scaled_eigvecs = eigvecs * scales[:, None]
+    Parameters:
+    - ori: array-like of shape (3,), origin of the ray
+    - dir: array-like of shape (3,), direction of the ray
+    - min_vec: array-like of shape (3,), minimum x, y, z of the bounding box
+    - max_vec: array-like of shape (3,), maximum x, y, z of the bounding box
 
-    min_vals = means[:, None] - scaled_eigvecs
-    max_vals = means[:, None] + scaled_eigvecs
+    Returns:
+    - bool: True if the ray intersects the bounding box, False otherwise
+    """
+    inv_dir = 1.0 / dir
+    t1 = (min_vec - ori) * inv_dir
+    t2 = (max_vec - ori) * inv_dir
 
-    # Returns an array of shape (N, 3, 3)
-    return min_vals, max_vals
+    t_min = np.minimum(t1, t2)
+    t_max = np.maximum(t1, t2)
+
+    t_near = np.max(t_min)
+    t_far = np.min(t_max)
+
+    return (t_near <= t_far) and (t_far >= 0)
+
+
+def create_bounding_boxes(means, covariances, scale=1.0):
+    n = means.shape[0]
+    # Perform eigen decomposition to get
+    # N x 3, N x 3 x 3 matrices for eigenvalues and eigenvectors respectively.
+    eigenvalues, eigenvectors = np.linalg.eig(covariances)
+
+    # Compute the corner offsets
+    # N x 3, Use the sign to permute the matrix.
+    axes = scale * np.sqrt(eigenvalues)
+
+    signs = np.array(
+        [
+            [1, 1, 1],
+            [1, 1, -1],
+            [1, -1, 1],
+            [1, -1, -1],
+            [-1, 1, 1],
+[-1, 1, -1],
+            [-1, -1, 1],
+            [-1, -1, -1],
+        ]
+    )
+    
+    repeated_axes = np.repeat(axes[:, np.newaxis, :], 8, axis=1)  # Repeat each row 8 times
+    signs_matrix = np.tile(signs, (n, 1,1))
+    corners_matrix = repeated_axes * signs_matrix
+    
+    # Translate to the mean
+    reshaped_means = means[:,None,:]
+    corners_matrix += reshaped_means
+
+    # Work out edges
+    edges_start = np.array([0, 0, 0, 1, 1, 2, 2, 3, 4, 4, 5, 6])
+    edges_end = np.array([1, 2, 4, 3, 5, 3, 6, 7, 5, 6, 7,7])
+
+    edges_start = corners_matrix[np.arange(n)[:, None], edges_start]
+    edges_end = corners_matrix[np.arange(n)[:, None], edges_end]
+
+    # Flatten edges
+    flattened_edges_start = edges_start.reshape(n*12, 3)
+    flattened_edges_end = edges_end.reshape(n*12, 3)
+    return flattened_edges_start, flattened_edges_end
+
+def create_bounding_box(mean, covariance, scale=1):
+    """
+    Create a set of lines representing a bounding box based on mean and covariance.
+
+    Parameters:
+    - mean: array-like of shape (3,)
+    - covariance: array-like of shape (3, 3)
+    - scale: float, scaling factor for the size of the bounding box
+
+    Returns:
+    - bounding_box: vedo.Lines object
+    """
+    # Perform eigen decomposition
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+
+    # Compute the corner offsets
+    l, w, h = scale * np.sqrt(eigenvalues)
+    corners = np.array(
+        [
+            [l, w, h],
+            [l, w, -h],
+            [l, -w, h],
+            [l, -w, -h],
+            [-l, w, h],
+            [-l, w, -h],
+            [-l, -w, h],
+            [-l, -w, -h],
+        ]
+    )
+
+# Rotate the corners
+    rotated_corners = corners @ eigenvectors.T
+
+    # Translate to the mean
+    rotated_corners += mean
+
+    # Define the edges between corners
+    edges = [
+        (0, 1),
+        (0, 2),
+        (0, 4),
+        (1, 3),
+        (1, 5),
+        (2, 3),
+        (2, 6),
+        (3, 7),
+        (4, 5),
+        (4, 6),
+        (5, 7),
+        (6, 7),
+    ]
+
+    start_pts = []
+    end_pts = []
+    for edge in edges:
+        start_pts.append(rotated_corners[edge[0]])
+        end_pts.append(rotated_corners[edge[1]])
+    bounding_box = vedo.Lines(start_pts, end_pts, c="red")
+
+    # Calculate minimum and maximum points
+    min_vec = np.min(rotated_corners, axis=0)
+    max_vec = np.max(rotated_corners, axis=0)
+    return bounding_box, min_vec, max_vec
 
 
 def calculate_batched_box_wireframes(min_vecs, max_vecs):
@@ -99,22 +221,8 @@ def load_data(path):
     vertex_data = ply["vertex"].data
     return pd.DataFrame(vertex_data)
 
-
-def get_covariances(quaternions, scales_vector):
-    """
-    @params
-    quaternions: np.array, of shape (Nx4). Quaternions of the splats.
-    scales_vector: np.array, of shape (Nx3). Scales of the splats.
-    @returns
-    covariances: np.array, of shape (Nx3x3). Covariances of the splats.
-    """
-    rotations = R.from_quat(quaternions[:, [1, 2, 3, 0]]).as_matrix()
-    scales = scales_vector[:, None] * np.eye(3)
-    covariances = (
-        rotations @ scales @ scales.transpose(0, 2, 1) @ rotations.transpose(0, 2, 1)
-    )
-    return covariances
-
+def get_covariances(rotations, scales_squared):
+    return rotations @ scales_squared @ rotations.transpose(0,2,1)
 
 def evaluate_positions(positions, means, covariances):
     """
@@ -207,24 +315,41 @@ def max_gaussian_along_ray(o, d, means, covs):
 
     return t_values
 
+def convert_scales_vector(scales_vector):
+    n = scales_vector.shape[0]
+    blanks = np.tile(np.eye(3), (n, 1, 1))  # Shape: (n, 3, 3)
+    squared_scales = (scales_vector ** 2).reshape(n, 3, 1)  # Shape: (n, 3, 1)
+    result = blanks * squared_scales  # Multiply each identity matrix by its scale vector
+    return result
 
 if __name__ == "__main__":
     import vedo
 
     df = load_data("bathtub.ply")
-    col_mask = [
-        "x",
-        "y",
-        "z",
-        "rot_0",
-        "rot_1",
-        "rot_2",
-        "rot_3",
-        "scale_0",
-        "scale_1",
-        "scale_2",
-        "opacity",
-    ]
+    pos_mask = ["x", "y", "z"]
+    quats_mask = ["rot_0", "rot_1", "rot_2", "rot_3"]
+    scales_mask = ["scale_0", "scale_1", "scale_2"]
+    opacity_mask = ["opacity"]
+    col_mask = [*pos_mask, *quats_mask, *scales_mask, opacity_mask]
+
+    means = df[pos_mask].to_numpy()
+    quaternions = df[quats_mask].to_numpy()
+    scales_vector = df[scales_mask].to_numpy()
+    opacity = df[opacity_mask].to_numpy()
+    
+    # Normalise the quaternions
+    quaternions = quaternions  / np.linalg.norm(quaternions)
+    rotations = R.from_quat(quaternions).as_matrix()
+    
+    scales_squared = convert_scales_vector(scales_vector)
+    covariances = get_covariances(rotations, scales_squared)
+    
+    start_pts, end_pts = create_bounding_boxes(means, covariances,0.01)
+    vizz_num = 300
+    bounding_boxes = vedo.Lines(start_pts[:vizz_num*12], end_pts[:vizz_num*12], c='red')
+    vedo.show(bounding_boxes)
+    raise Exception
+
 
     intersected_gaussians = (df[col_mask].to_numpy())[:1000, :]
     ori = np.array([0, 0, 0])
