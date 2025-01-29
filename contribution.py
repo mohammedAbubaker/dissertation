@@ -3,8 +3,37 @@ from plyfile import PlyData
 import pandas as pd
 import numpy as np
 from scipy.spatial.transform import Rotation as R
-from vedo.utils import print_table
+import vedo
 
+
+import torch
+
+def ray_intersects_bboxes(ray_ori, ray_dir, min_vecs, max_vecs):
+    inv_dir = 1.0 / ray_dir
+    t1 = (min_vecs - ray_ori) * inv_dir
+    t2 = (max_vecs - ray_ori) * inv_dir
+
+    t_min = torch.minimum(t1, t2)
+    t_max = torch.maximum(t1, t2)
+
+    t_near = torch.max(t_min, dim=-1).values
+    t_far = torch.min(t_max, dim=-1).values
+    
+    return (t_near <= t_far) & (t_far >= 0)
+
+def rays_intersect_bboxes(ray_ori, ray_dirs, min_vecs, max_vecs):
+    intersections = {}
+    for idx, ray_dir in enumerate(ray_dirs):
+
+        does_intersect = ray_intersects_bboxes(
+                torch.from_numpy(ray_ori),
+                torch.from_numpy(ray_dir), 
+                torch.from_numpy(min_vecs), 
+                torch.from_numpy(max_vecs)
+        )
+        
+        intersections[idx] = torch.where(does_intersect == True)[0]
+    return intersections 
 
 def ray_intersects_bbox(ori, dir, min_vec, max_vec):
     """
@@ -62,7 +91,11 @@ def create_bounding_boxes(means, covariances, scale=1.0):
     # Translate to the mean
     reshaped_means = means[:,None,:]
     corners_matrix += reshaped_means
-
+    
+    # Grab the minimums and maximums for bounding intersection logic
+    mins= np.min(corners_matrix, axis=1)
+    maxs = np.max(corners_matrix, axis=1)
+ 
     # Work out edges
     edges_start = np.array([0, 0, 0, 1, 1, 2, 2, 3, 4, 4, 5, 6])
     edges_end = np.array([1, 2, 4, 3, 5, 3, 6, 7, 5, 6, 7,7])
@@ -70,151 +103,7 @@ def create_bounding_boxes(means, covariances, scale=1.0):
     edges_start = corners_matrix[np.arange(n)[:, None], edges_start]
     edges_end = corners_matrix[np.arange(n)[:, None], edges_end]
 
-    # Flatten edges
-    flattened_edges_start = edges_start.reshape(n*12, 3)
-    flattened_edges_end = edges_end.reshape(n*12, 3)
-    return flattened_edges_start, flattened_edges_end
-
-def create_bounding_box(mean, covariance, scale=1):
-    """
-    Create a set of lines representing a bounding box based on mean and covariance.
-
-    Parameters:
-    - mean: array-like of shape (3,)
-    - covariance: array-like of shape (3, 3)
-    - scale: float, scaling factor for the size of the bounding box
-
-    Returns:
-    - bounding_box: vedo.Lines object
-    """
-    # Perform eigen decomposition
-    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
-
-    # Compute the corner offsets
-    l, w, h = scale * np.sqrt(eigenvalues)
-    corners = np.array(
-        [
-            [l, w, h],
-            [l, w, -h],
-            [l, -w, h],
-            [l, -w, -h],
-            [-l, w, h],
-            [-l, w, -h],
-            [-l, -w, h],
-            [-l, -w, -h],
-        ]
-    )
-
-# Rotate the corners
-    rotated_corners = corners @ eigenvectors.T
-
-    # Translate to the mean
-    rotated_corners += mean
-
-    # Define the edges between corners
-    edges = [
-        (0, 1),
-        (0, 2),
-        (0, 4),
-        (1, 3),
-        (1, 5),
-        (2, 3),
-        (2, 6),
-        (3, 7),
-        (4, 5),
-        (4, 6),
-        (5, 7),
-        (6, 7),
-    ]
-
-    start_pts = []
-    end_pts = []
-    for edge in edges:
-        start_pts.append(rotated_corners[edge[0]])
-        end_pts.append(rotated_corners[edge[1]])
-    bounding_box = vedo.Lines(start_pts, end_pts, c="red")
-
-    # Calculate minimum and maximum points
-    min_vec = np.min(rotated_corners, axis=0)
-    max_vec = np.max(rotated_corners, axis=0)
-    return bounding_box, min_vec, max_vec
-
-
-def calculate_batched_box_wireframes(min_vecs, max_vecs):
-    """
-    Compute wireframes for multiple boxes in a fully vectorized manner.
-
-    Parameters:
-        min_vecs: np.array of shape (N, 3), minimum x, y, z for each box.
-        max_vecs: np.array of shape (N, 3), maximum x, y, z for each box.
-
-    Returns:
-        edges: np.array of shape (N, 12, 2, 3), where:
-               - N is the number of boxes
-               - 12 is the number of edges per box
-               - 2 is the start and end point of each edge
-               - 3 is the 3D coordinates of the point
-    """
-    # Ensure inputs are valid
-    assert min_vecs.shape == max_vecs.shape, (
-        "min_vecs and max_vecs must have the same shape"
-    )
-    assert min_vecs.shape[1] == 3, "Each vector must have 3 components (x, y, z)"
-
-    # Generate all 8 corners for each box using broadcasting
-    corners = np.stack(
-        [
-            np.array(
-                [min_vecs[:, 0], min_vecs[:, 1], min_vecs[:, 2]]
-            ).T,  # [x_min, y_min, z_min]
-            np.array(
-                [max_vecs[:, 0], min_vecs[:, 1], min_vecs[:, 2]]
-            ).T,  # [x_max, y_min, z_min]
-            np.array(
-                [max_vecs[:, 0], max_vecs[:, 1], min_vecs[:, 2]]
-            ).T,  # [x_max, y_max, z_min]
-            np.array(
-                [min_vecs[:, 0], max_vecs[:, 1], min_vecs[:, 2]]
-            ).T,  # [x_min, y_max, z_min]
-            np.array(
-                [min_vecs[:, 0], min_vecs[:, 1], max_vecs[:, 2]]
-            ).T,  # [x_min, y_min, z_max]
-            np.array(
-                [max_vecs[:, 0], min_vecs[:, 1], max_vecs[:, 2]]
-            ).T,  # [x_max, y_min, z_max]
-            np.array(
-                [max_vecs[:, 0], max_vecs[:, 1], max_vecs[:, 2]]
-            ).T,  # [x_max, y_max, z_max]
-            np.array(
-                [min_vecs[:, 0], max_vecs[:, 1], max_vecs[:, 2]]
-            ).T,  # [x_min, y_max, z_max]
-        ],
-        axis=1,
-    )  # Shape: (N, 8, 3)
-
-    # Define the 12 edges using indices of the corners
-    edge_indices = np.array(
-        [
-            [0, 1],
-            [1, 2],
-            [2, 3],
-            [3, 0],  # Bottom face
-            [4, 5],
-            [5, 6],
-            [6, 7],
-            [7, 4],  # Top face
-            [0, 4],
-            [1, 5],
-            [2, 6],
-            [3, 7],  # Vertical edges
-        ]
-    )  # Shape: (12, 2)
-
-    # Gather corner coordinates for the edges
-    edges = corners[:, edge_indices]  # Shape: (N, 12, 2, 3)
-
-    return edges
-
+    return edges_start, edges_end, mins, maxs
 
 def load_data(path):
     ply = PlyData.read(path)
@@ -222,7 +111,7 @@ def load_data(path):
     return pd.DataFrame(vertex_data)
 
 def get_covariances(rotations, scales_squared):
-    return rotations @ scales_squared @ rotations.transpose(0,2,1)
+    return rotations.transpose(0,2,1) @ scales_squared @ rotations
 
 def evaluate_positions(positions, means, covariances):
     """
@@ -322,6 +211,35 @@ def convert_scales_vector(scales_vector):
     result = blanks * squared_scales  # Multiply each identity matrix by its scale vector
     return result
 
+def generate_rays():
+    camera_ori = np.array([0, 0, 0])
+    camera_dir = np.array([0,1,0])
+
+    viewport_upper_right = np.array([2,1,1])
+    viewport_lower_left = np.array([-2,-1,1])
+    
+    res = 100
+    
+    viewport_centres_x = np.arange(
+            viewport_lower_left[0], 
+            viewport_upper_right[0],
+            (viewport_upper_right[0] - viewport_lower_left[0]) / res
+    )
+
+    viewport_centres_y = np.arange(
+            viewport_lower_left[1], 
+            viewport_upper_right[1],
+            (viewport_upper_right[1] - viewport_lower_left[1]) / res
+    )
+
+    grid_1, grid_2 = np.meshgrid(viewport_centres_x, viewport_centres_y, indexing="ij")
+    viewport_grid = np.column_stack((grid_1.ravel(), grid_2.ravel()))
+    z_layer_shape = (viewport_grid.shape[0], 1)
+    z_layer = np.full(z_layer_shape, viewport_upper_right[2])  # Shape: NxMx1S
+    full_viewport = np.concatenate((viewport_grid, z_layer), axis=1)
+    return full_viewport
+    raise Exception
+
 if __name__ == "__main__":
     import vedo
 
@@ -339,15 +257,45 @@ if __name__ == "__main__":
     
     # Normalise the quaternions
     quaternions = quaternions  / np.linalg.norm(quaternions)
+
     rotations = R.from_quat(quaternions).as_matrix()
     
     scales_squared = convert_scales_vector(scales_vector)
     covariances = get_covariances(rotations, scales_squared)
     
-    start_pts, end_pts = create_bounding_boxes(means, covariances,0.01)
-    vizz_num = 300
-    bounding_boxes = vedo.Lines(start_pts[:vizz_num*12], end_pts[:vizz_num*12], c='red')
-    vedo.show(bounding_boxes)
+    start_pts, end_pts, bbox_mins, bbox_maxs = create_bounding_boxes(means, covariances,0.001)
+    ray_ori = np.array([0,0,0])
+    ray_dirs = generate_rays()
+    intersections = rays_intersect_bboxes(ray_ori, ray_dirs, bbox_mins, bbox_maxs)
+
+    # Select a random ray
+    selected_ray = 57
+
+    selected_start_pts = start_pts[intersections[selected_ray]]
+    selected_end_pts = end_pts[intersections[selected_ray]]
+    print("Selected_start_pts: ", selected_start_pts.shape)
+    print("Selected_end_pts: ", selected_end_pts.shape)
+    
+    
+    non_selected_start_pts = start_pts.reshape(start_pts.shape[0] * 12, 3)
+    non_selected_end_pts = end_pts.reshape(end_pts.shape[0] * 12, 3)
+
+    # Flatten
+    selected_start_pts = selected_start_pts.reshape(selected_start_pts.shape[0] * 12, 3)
+    selected_end_pts = selected_end_pts.reshape(selected_end_pts.shape[0] * 12, 3)
+    
+    selected_bounding_boxes = vedo.Lines(selected_start_pts, selected_end_pts, lw=3)
+    ray_lines = vedo.Line(ray_ori, ray_dirs[selected_ray] )
+    non_selected_boxes = vedo.Lines(non_selected_start_pts, non_selected_end_pts, dotted=True)
+
+    draw_objects = []
+
+    draw_objects.append(selected_bounding_boxes)
+    draw_objects.append(ray_lines)
+    draw_objects.append(non_selected_boxes)
+
+    vedo.show(draw_objects)
+    # vedo.show([vedo.Points(viewport_centres), vedo.Point(np.array([0,0,3])), bounding_boxes])
     raise Exception
 
 
