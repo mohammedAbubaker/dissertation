@@ -4,12 +4,9 @@ import pandas as pd
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 import vedo
-
-
-import torch
-
+import cupy as torch
 def ray_intersects_bboxes(ray_ori, ray_dir, min_vecs, max_vecs):
-    inv_dir = 1.0 / ray_dir
+    inv_dir = 1.0 / (ray_dir + 1e-8)
     t1 = (min_vecs - ray_ori) * inv_dir
     t2 = (max_vecs - ray_ori) * inv_dir
 
@@ -18,22 +15,21 @@ def ray_intersects_bboxes(ray_ori, ray_dir, min_vecs, max_vecs):
 
     t_near = torch.max(t_min, dim=-1).values
     t_far = torch.min(t_max, dim=-1).values
-    
+
     return (t_near <= t_far) & (t_far >= 0)
 
 def rays_intersect_bboxes(ray_ori, ray_dirs, min_vecs, max_vecs):
     intersections = {}
     for idx, ray_dir in enumerate(ray_dirs):
-
         does_intersect = ray_intersects_bboxes(
-                torch.from_numpy(ray_ori),
-                torch.from_numpy(ray_dir), 
-                torch.from_numpy(min_vecs), 
-                torch.from_numpy(max_vecs)
+            torch.from_numpy(ray_ori),
+            torch.from_numpy(ray_dir),
+            torch.from_numpy(min_vecs),
+            torch.from_numpy(max_vecs),
         )
-        
-        intersections[idx] = torch.where(does_intersect == True)[0]
-    return intersections 
+        ray_intersections = torch.where(does_intersect == True)[0]
+        intersections[idx] = ray_intersections.reshape(ray_intersections.shape[0])  
+    return intersections
 
 def ray_intersects_bbox(ori, dir, min_vec, max_vec):
     """
@@ -60,8 +56,7 @@ def ray_intersects_bbox(ori, dir, min_vec, max_vec):
 
     return (t_near <= t_far) and (t_far >= 0)
 
-
-def create_bounding_boxes(means, covariances, scale=1.0):
+def create_bounding_boxes(means, covariances, scales):
     n = means.shape[0]
     # Perform eigen decomposition to get
     # N x 3, N x 3 x 3 matrices for eigenvalues and eigenvectors respectively.
@@ -69,7 +64,7 @@ def create_bounding_boxes(means, covariances, scale=1.0):
 
     # Compute the corner offsets
     # N x 3, Use the sign to permute the matrix.
-    axes = scale * np.sqrt(eigenvalues)
+    axes = torch.bmm() 
 
     signs = np.array(
         [
@@ -78,27 +73,29 @@ def create_bounding_boxes(means, covariances, scale=1.0):
             [1, -1, 1],
             [1, -1, -1],
             [-1, 1, 1],
-[-1, 1, -1],
+            [-1, 1, -1],
             [-1, -1, 1],
             [-1, -1, -1],
         ]
     )
-    
-    repeated_axes = np.repeat(axes[:, np.newaxis, :], 8, axis=1)  # Repeat each row 8 times
-    signs_matrix = np.tile(signs, (n, 1,1))
+
+    repeated_axes = np.repeat(
+        axes[:, np.newaxis, :], 8, axis=1
+    )  # Repeat each row 8 times
+    signs_matrix = np.tile(signs, (n, 1, 1))
     corners_matrix = repeated_axes * signs_matrix
-    
+
     # Translate to the mean
-    reshaped_means = means[:,None,:]
+    reshaped_means = means[:, None, :]
     corners_matrix += reshaped_means
-    
+
     # Grab the minimums and maximums for bounding intersection logic
-    mins= np.min(corners_matrix, axis=1)
+    mins = np.min(corners_matrix, axis=1)
     maxs = np.max(corners_matrix, axis=1)
- 
+
     # Work out edges
     edges_start = np.array([0, 0, 0, 1, 1, 2, 2, 3, 4, 4, 5, 6])
-    edges_end = np.array([1, 2, 4, 3, 5, 3, 6, 7, 5, 6, 7,7])
+    edges_end = np.array([1, 2, 4, 3, 5, 3, 6, 7, 5, 6, 7, 7])
 
     edges_start = corners_matrix[np.arange(n)[:, None], edges_start]
     edges_end = corners_matrix[np.arange(n)[:, None], edges_end]
@@ -111,7 +108,7 @@ def load_data(path):
     return pd.DataFrame(vertex_data)
 
 def get_covariances(rotations, scales_squared):
-    return rotations.transpose(0,2,1) @ scales_squared @ rotations
+    return rotations.transpose(0, 2, 1) @ scales_squared @ rotations
 
 def evaluate_positions(positions, means, covariances):
     """
@@ -126,37 +123,39 @@ def evaluate_positions(positions, means, covariances):
         values (ndarray): shape (N,). The 3D Gaussian values at each position.
     """
     # Perform standardisation
-    pos_mean = np.mean(positions, axis=0)
-    pos_std = np.std(positions, axis=0)
+    pos_mean = torch.mean(positions, dim=0)
+    pos_std = torch.std(positions, dim=0)
     standardized_positions = (positions - pos_mean) / pos_std
     standardized_means = (means - pos_mean) / pos_std
 
     # Vector from mean to each position
     diff = standardized_positions - standardized_means
-    diff = diff[:, :, None]
     # Invert covariance matrices
-    inv_covs = np.linalg.inv(covariances)  # (N,3,3)
-    exponents = diff.transpose(0, 2, 1) @ inv_covs @ diff
-    weights = np.exp(-0.5 * exponents).squeeze()
+    inv_covs = torch.linalg.inv(covariances)  # (N,3,3)
+    exponents = torch.bmm(torch.bmm(diff[:,None,:], inv_covs), diff[:,:,None])
+    weights = torch.exp(-0.5 * exponents)
     return weights
 
-
-def get_contributions(ori, dir, intersected_gaussians):
+def get_contributions(ori, dir, means, covariances):
     """
     @params
     intersected_gaussians: [11,N] where N is the number of intersected gaussians.
     """
-    N = intersected_gaussians.shape[0]
+    n = means.shape[0]
+    t_values = max_gaussian_along_ray(ori, dir, means, covariances)
+    positions = ori + t_values * dir
+    evaluated_positions = evaluate_positions(positions, means, covariances)
 
-    means = intersected_gaussians[:, 0:3]
-    quaternions = intersected_gaussians[:, 3:7]
-    scales_vector = intersected_gaussians[:, 7:10]
-    # Retrieve covariances
-    covs = get_covariances(quaternions, scales_vector)
-    t_values = max_gaussian_along_ray(ori, dir, means, covs)
-    positions = ori + t_values[:, None] * dir
-    return evaluate_positions(positions, means, covs)
-
+    # Front to back compositing
+    # Sort the gaussians
+    sorted_indices = torch.argsort(means[:,2])
+    sorted_values = evaluated_positions[sorted_indices]
+    contributions = torch.zeros(n,1)
+    accumulated_opacity = 0
+    for i, value in enumerate(sorted_values):
+        contributions[i] = value * (1-accumulated_opacity) 
+        accumulated_opacity += value * (1 - accumulated_opacity)
+    return contributions 
 
 def max_gaussian_along_ray(o, d, means, covs):
     """
@@ -173,63 +172,56 @@ def max_gaussian_along_ray(o, d, means, covs):
                                           If t < 0, that maximum is "behind" the origin
                                           relative to d.
     """
-    o = np.asarray(o, dtype=float)  # (3,)
-    d = np.asarray(d, dtype=float)  # (3,)
-    d /= np.linalg.norm(d)  # Normalize ray direction
+    n = means.shape[0]
+    inv_covs = torch.linalg.inv(covs)
+    dx_t = (means - o)[:,None,:]
+    dx_t = dx_t.to(torch.float64)
+    numerator = torch.bmm(torch.bmm(dx_t, inv_covs), torch.tile(d, (n,1))[:,:,None])
+    denomenator = torch.bmm(torch.bmm(torch.tile(d, (n, 1))[:,None,:], inv_covs), torch.tile(d, (n,1))[:,:,None])
+    return (numerator / denomenator).reshape(n,1)
 
-    means = means.astype(float)  # (N,3)
-    covs = covs.astype(float)  # (N,3,3)
-    N = means.shape[0]
-
-    # Compute Σ⁻¹ for each Gaussian
-    inv_covs = np.linalg.inv(covs)  # shape (N,3,3)
-    # (o - μ) => shape (N,3)
-    o_minus_mu = o[None, :] - means  # broadcast origin to each Gaussian
-    # We need (o - μ)ᵀ Σ⁻¹ d and dᵀ Σ⁻¹ d for each Gaussian.
-
-    # Step 1) Let Aᵢ = Σᵢ⁻¹ d => shape (N,3)
-    # We can do this with einstein summation or matmul:
-    #   inv_covs has shape (N,3,3), d has shape (3,)
-    A = np.einsum("nij,j->ni", inv_covs, d)  # shape (N,3)
-    # Step 2) dᵀ Σᵢ⁻¹ d => shape (N,)
-    d_invCov_d = np.einsum("ni,i->n", A, d)  # dot each (N,3) with (3,)
-
-    # Step 3) (o - μ)ᵀ Σᵢ⁻¹ d => shape (N,)
-    o_minus_mu_invCov_d = np.einsum("ni,ni->n", o_minus_mu, A)
-
-    # Step 4) Solve for tᵢ
-    #   tᵢ = - [ (o - μᵢ)ᵀ Σᵢ⁻¹ d ] / [ dᵀ Σᵢ⁻¹ d ]
-    eps = 1e-12  # small offset in case any d_invCov_d = 0
-    t_values = -o_minus_mu_invCov_d / (d_invCov_d + eps)
-
-    return t_values
+def convert_scales_squared_vector(scales_vector):
+    n = scales_vector.shape[0]
+    blanks = torch.tile(torch.eye(3), (n, 1, 1))  # Shape: (n, 3, 3)
+    squared_scales = (scales_vector**2).reshape(n, 3, 1)  # Shape: (n, 3, 1)
+    result = (
+        blanks * squared_scales
+    )  # Multiply each identity matrix by its scale vector
+    return result
 
 def convert_scales_vector(scales_vector):
     n = scales_vector.shape[0]
-    blanks = np.tile(np.eye(3), (n, 1, 1))  # Shape: (n, 3, 3)
-    squared_scales = (scales_vector ** 2).reshape(n, 3, 1)  # Shape: (n, 3, 1)
-    result = blanks * squared_scales  # Multiply each identity matrix by its scale vector
+    blanks = torch.tile(torch.eye(3), (n, 1, 1))  # Shape: (n, 3, 3)
+    squared_scales = (scales_vector).reshape(n, 3, 1)  # Shape: (n, 3, 1)
+    result = (
+        blanks * squared_scales
+    )  # Multiply each identity matrix by its scale vector
     return result
 
-def generate_rays():
-    camera_ori = np.array([0, 0, 0])
-    camera_dir = np.array([0,1,0])
+def test(intersections, ray_dirs, ray_ori, means, covariances):
+    n = means.shape[0]
+    sorted_means = means[:, 2].argsort()
+    contributions = torch.zeros(n,1)
+    for ray_idx, gaussians_idx in intersections.items():
+        contributions[gaussians_idx] = get_contributions(ray_ori, ray_dirs[ray_idx], means[gaussians_idx], covariances[gaussians_idx])
+    return contributions
+        
 
-    viewport_upper_right = np.array([2,1,1])
-    viewport_lower_left = np.array([-2,-1,1])
-    
+def generate_rays(ray_ori):
+    viewport_upper_right = np.array([2+ray_ori[0], 1 + ray_ori[1], 1 + ray_ori[2]])
+    viewport_lower_left = np.array([-2+ray_ori[0], -1 + ray_ori[1], 1 + ray_ori[2]])
     res = 100
-    
+
     viewport_centres_x = np.arange(
-            viewport_lower_left[0], 
-            viewport_upper_right[0],
-            (viewport_upper_right[0] - viewport_lower_left[0]) / res
+        viewport_lower_left[0],
+        viewport_upper_right[0],
+        (viewport_upper_right[0] - viewport_lower_left[0]) / res,
     )
 
     viewport_centres_y = np.arange(
-            viewport_lower_left[1], 
-            viewport_upper_right[1],
-            (viewport_upper_right[1] - viewport_lower_left[1]) / res
+        viewport_lower_left[1],
+        viewport_upper_right[1],
+        (viewport_upper_right[1] - viewport_lower_left[1]) / res,
     )
 
     grid_1, grid_2 = np.meshgrid(viewport_centres_x, viewport_centres_y, indexing="ij")
@@ -238,7 +230,6 @@ def generate_rays():
     z_layer = np.full(z_layer_shape, viewport_upper_right[2])  # Shape: NxMx1S
     full_viewport = np.concatenate((viewport_grid, z_layer), axis=1)
     return full_viewport
-    raise Exception
 
 if __name__ == "__main__":
     import vedo
@@ -251,53 +242,45 @@ if __name__ == "__main__":
     col_mask = [*pos_mask, *quats_mask, *scales_mask, opacity_mask]
 
     means = df[pos_mask].to_numpy()
+    n = means.shape[0]
     quaternions = df[quats_mask].to_numpy()
     scales_vector = df[scales_mask].to_numpy()
     opacity = df[opacity_mask].to_numpy()
-    
+
     # Normalise the quaternions
-    quaternions = quaternions  / np.linalg.norm(quaternions)
+    quaternions = quaternions / np.linalg.norm(quaternions)
 
     rotations = R.from_quat(quaternions).as_matrix()
-    
-    scales_squared = convert_scales_vector(scales_vector)
+
+    scales = convert_scales_vector(torch.array(scales_vector.data))
+    scales_squared = convert_scales_squared_vector(scales_vector)
     covariances = get_covariances(rotations, scales_squared)
-    
-    start_pts, end_pts, bbox_mins, bbox_maxs = create_bounding_boxes(means, covariances,0.001)
-    ray_ori = np.array([0,0,0])
-    ray_dirs = generate_rays()
+
+    start_pts, end_pts, bbox_mins, bbox_maxs = create_bounding_boxes(
+        means, covariances, scales
+    )
+    ray_ori = np.array([0, 0, 0])
+    ray_dirs = generate_rays(ray_ori)
     intersections = rays_intersect_bboxes(ray_ori, ray_dirs, bbox_mins, bbox_maxs)
-
-    # Select a random ray
-    selected_ray = 57
-
-    selected_start_pts = start_pts[intersections[selected_ray]]
-    selected_end_pts = end_pts[intersections[selected_ray]]
-    print("Selected_start_pts: ", selected_start_pts.shape)
-    print("Selected_end_pts: ", selected_end_pts.shape)
-    
-    
-    non_selected_start_pts = start_pts.reshape(start_pts.shape[0] * 12, 3)
-    non_selected_end_pts = end_pts.reshape(end_pts.shape[0] * 12, 3)
-
-    # Flatten
-    selected_start_pts = selected_start_pts.reshape(selected_start_pts.shape[0] * 12, 3)
-    selected_end_pts = selected_end_pts.reshape(selected_end_pts.shape[0] * 12, 3)
-    
-    selected_bounding_boxes = vedo.Lines(selected_start_pts, selected_end_pts, lw=3)
-    ray_lines = vedo.Line(ray_ori, ray_dirs[selected_ray] )
-    non_selected_boxes = vedo.Lines(non_selected_start_pts, non_selected_end_pts, dotted=True)
+    contributions = test(
+        intersections, 
+        torch.from_numpy(ray_dirs), 
+        torch.from_numpy(ray_ori), 
+        torch.from_numpy(means), 
+        torch.from_numpy(covariances),
+    )
 
     draw_objects = []
-
-    draw_objects.append(selected_bounding_boxes)
-    draw_objects.append(ray_lines)
-    draw_objects.append(non_selected_boxes)
+    # draw_objects.append(vedo.Spheres(centers=means, r=contributions*0.01))
+    # draw_objects.append(vedo.Lines(start_pts=np.tile(ray_ori, (ray_dirs.shape[0], 1)), end_pts=ray_dirs))
+    #draw_objects.append(vedo.Points(means))
+    # draw_objects.append(vedo.Lines(start_pts=start_pts.reshape(-1, 3), end_pts=end_pts.reshape(-1,3)))
+    for ray_idx, gaussians_idx in intersections.items():
+        box_lines = vedo.Lines(start_pts[gaussians_idx].reshape(-1,3), end_pts[gaussians_idx].reshape(-1,3)) 
+        draw_objects.append(box_lines)
 
     vedo.show(draw_objects)
-    # vedo.show([vedo.Points(viewport_centres), vedo.Point(np.array([0,0,3])), bounding_boxes])
     raise Exception
-
 
     intersected_gaussians = (df[col_mask].to_numpy())[:1000, :]
     ori = np.array([0, 0, 0])
